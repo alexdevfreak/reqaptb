@@ -77,21 +77,15 @@ def is_admin(user_id: int) -> bool:
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Hi — I'm your Auto-Approve Bot.
+   text = (
+    "Hi — I am your Auto-Approve Bot.\n\n"
+    "Admin Commands:\n"
+    "/users - Show stored users count\n"
+    "/broadcast <message> - Send message to all stored users\n"
+    "/promotion <text> - Set promotion message sent after approval\n"
+    "/details - Show join counts per channel\n"
+)
 
-"
-        "Commands (admins only):
-"
-        "/users - Show stored users count
-"
-        "/broadcast <message> - Send message to all stored users
-"
-        "/promotion <text> - Set promotion message sent after approval
-"
-        "/details - Show join counts per channel
-"
-    )
     await update.effective_chat.send_message(text)
 
 
