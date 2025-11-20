@@ -86,7 +86,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     "/details - Show join counts per channel\n"
 )
 
-    await update.effective_chat.send_message(text)
+  await update.effective_chat.send_message("
+
 
 
 async def set_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
