@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Advanced Auto-Approve Bot (full, corrected)
+Advanced Auto-Approve Bot — robust, production-ready.
 
-Behavior:
+Features:
 - Auto-approve chat join requests
-- If the user has started the bot: DM a welcome + promo message on approval
-- If DM fails (user didn't start the bot / forbidden): post a welcome + promo in the channel/group, mentioning the user
-- Log each approval to DATA_CHANNEL_ID (acts as your "database channel")
-- Persist approvals in a JSON file (PERSIST_FILE)
+- DM welcome + promotion if user has started bot
+- Fallback to posting a mention in the channel/group if DM fails
+- Log approvals to DATA_CHANNEL_ID
+- Persist approvals to a JSON file (PERSIST_FILE)
+- Admin commands: /start, /users, /details, /promotion, /broadcast
+- Retries on Telegram 409 Conflict (another getUpdates instance)
 """
 
 import os
@@ -19,8 +21,9 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
 
 from dotenv import load_dotenv
-from telegram import Update, Chat, ChatJoinRequest
+from telegram import Update, ChatJoinRequest
 from telegram.constants import ParseMode
+from telegram import error as tg_error
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -30,13 +33,21 @@ from telegram.ext import (
     filters,
 )
 
-# ------------
-# Load env
-# ------------
+# -------------------------
+# Load environment
+# -------------------------
 load_dotenv()
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS_RAW: str = os.getenv("ADMIN_IDS", "").strip()
+DATA_CHANNEL_ID: int = int(os.getenv("DATA_CHANNEL_ID", "0") or 0)
+LOG_CHANNEL_ID: int = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
+PERSIST_FILE: str = os.getenv("PERSIST_FILE", "data.json").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required. Set it in environment or .env")
+
+# parse admins safely
 ADMIN_IDS: List[int] = []
 for part in ADMIN_IDS_RAW.split(","):
     p = part.strip()
@@ -45,37 +56,28 @@ for part in ADMIN_IDS_RAW.split(","):
     try:
         ADMIN_IDS.append(int(p))
     except ValueError:
-        # ignore invalid
+        # ignore invalid entries
         pass
 
-DATA_CHANNEL_ID: int = int(os.getenv("DATA_CHANNEL_ID", "0") or 0)
-LOG_CHANNEL_ID: int = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
-PERSIST_FILE: str = os.getenv("PERSIST_FILE", "data.json").strip()
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required. Set it in .env")
-
-# ------------
+# -------------------------
 # Logging
-# ------------
+# -------------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("auto_approve_bot")
 
-# ------------
-# Persistence
-# ------------
+# -------------------------
+# Persistence (JSON)
+# -------------------------
 # DATA structure:
 # {
 #   "promotion_message": "",
 #   "chats": {
 #       "<chat_id>": {
 #           "title": "<chat_title>",
-#           "users": [
-#               {"id": 123, "full_name": "Name", "username": "name", "approved_at": "<iso>"}
-#           ]
+#           "users": [ { "id": int, "full_name": str, "username": str|None, "approved_at": iso } ]
 #       }
 #   }
 # }
@@ -98,7 +100,7 @@ def load_data() -> None:
                 DATA["chats"] = {}
             logger.info("Loaded data from %s", PERSIST_FILE)
     except Exception as e:
-        logger.error("Failed to load %s: %s", PERSIST_FILE, e)
+        logger.warning("Could not load %s: %s", PERSIST_FILE, e)
         DATA = {"promotion_message": "", "chats": {}}
 
 
@@ -110,43 +112,39 @@ def save_data() -> None:
         logger.exception("Failed to save %s: %s", PERSIST_FILE, e)
 
 
-# ------------
+# -------------------------
 # Helpers
-# ------------
+# -------------------------
 def is_admin(user_id: Optional[int]) -> bool:
-    if not user_id:
-        return False
-    return user_id in ADMIN_IDS
+    return user_id is not None and user_id in ADMIN_IDS
 
 
 async def safe_send_log(application, text: str) -> None:
     if not LOG_CHANNEL_ID:
         return
     try:
-        await application.bot.send_message(
-            chat_id=LOG_CHANNEL_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
+        await application.bot.send_message(chat_id=LOG_CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error("Failed to send admin log: %s", e)
+        logger.warning("safe_send_log failed: %s", e)
 
 
 def html_escape(s: Optional[str]) -> str:
     return html.escape(s or "")
 
 
-# ------------
-# Commands
-# ------------
+# -------------------------
+# Command handlers
+# -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 Hello!\n\n"
-        "This bot auto-approves channel/group join requests (if bot is admin), "
-        "DMs welcome+promo when possible, and logs approvals to your data channel.\n\n"
+        "This bot auto-approves join requests (if the bot is admin in the group/channel), "
+        "DMs welcome+promo when possible, logs approvals to your data channel and stores users in JSON.\n\n"
         "Admin commands:\n"
-        "/users - Total approved users stored\n"
-        "/details - Channel-wise approved users\n"
-        "/promotion <text> - Set promotion message\n"
-        "/broadcast <text> - Broadcast to all stored users\n"
+        "/users - total approved users stored\n"
+        "/details - channel-wise approved users\n"
+        "/promotion <text> - set promotion message\n"
+        "/broadcast <text> - broadcast to all stored users\n"
     )
     await update.effective_message.reply_text(text)
 
@@ -156,7 +154,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not u or not is_admin(u.id):
         return
     async with DATA_LOCK:
-        total = sum(len(chat.get("users", [])) for chat in DATA.get("chats", {}).values())
+        total = sum(len(c.get("users", [])) for c in DATA.get("chats", {}).values())
     await update.effective_message.reply_text(f"📦 Total approved users stored: {total}")
 
 
@@ -197,12 +195,11 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("❗ Usage: /broadcast <text>")
         return
 
-    # Collect recipients
     async with DATA_LOCK:
         recipients: Set[int] = set()
         for info in DATA.get("chats", {}).values():
-            for user in info.get("users", []):
-                uid = user.get("id")
+            for uinfo in info.get("users", []):
+                uid = uinfo.get("id")
                 if isinstance(uid, int):
                     recipients.add(uid)
 
@@ -219,20 +216,19 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(f"✅ Broadcast finished. Sent: {sent}, Failed: {failed}")
 
 
-# ------------
-# Join request handler (DM if possible; otherwise post in channel with mention)
-# ------------
+# -------------------------
+# Join request handler (DM if possible; fallback to channel mention)
+# -------------------------
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     req: ChatJoinRequest = update.chat_join_request
     app = context.application
 
     try:
-        # Approve join request using bot API (safer than req.approve() cross-version)
+        # Approve via API call (works reliably)
         try:
             await context.bot.approve_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
         except Exception as e:
-            logger.exception("Failed to approve request via API: %s", e)
-            # still continue to try logging/notify
+            logger.warning("approve_chat_join_request API call failed: %s", e)
 
         user = req.from_user
         chat = req.chat
@@ -244,16 +240,14 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         channel_title = (chat.title or "").strip() if chat else "Unknown"
         approved_at = datetime.utcnow().isoformat()
 
-        # Persist the approval
+        # Persist
         async with DATA_LOCK:
             chats = DATA.setdefault("chats", {})
             chat_entry = chats.setdefault(str(chat_id), {"title": channel_title, "users": []})
-            chat_entry["title"] = channel_title  # update if changed
+            chat_entry["title"] = channel_title
             exists = any(u.get("id") == user_id for u in chat_entry["users"])
             if not exists and user_id:
-                chat_entry["users"].append(
-                    {"id": user_id, "full_name": full_name, "username": username, "approved_at": approved_at}
-                )
+                chat_entry["users"].append({"id": user_id, "full_name": full_name, "username": username, "approved_at": approved_at})
             save_data()
 
         # Prepare messages
@@ -263,26 +257,24 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Try DM first
         dm_ok = False
-        try:
-            if user_id:
+        if user_id:
+            try:
                 await app.bot.send_message(chat_id=user_id, text=welcome_text + ("\n\n" + promo if promo else ""),
                                            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
                 dm_ok = True
-        except Exception as e:
-            logger.info("Could not DM user %s: %s", user_id, e)
-            dm_ok = False
+            except Exception as e:
+                logger.info("Could not DM user %s: %s", user_id, e)
 
-        # If DM failed, post in the channel with mention
+        # Fallback: post in the chat with mention
         if not dm_ok:
             mention = f'<a href="tg://user?id={user_id}">{html_escape(full_name)}</a>'
             channel_msg = f"🎉 {mention} has been approved to join <b>{html_escape(channel_title)}</b>."
             if promo:
                 channel_msg += f"\n\n{promo}"
             try:
-                await app.bot.send_message(chat_id=chat_id, text=channel_msg,
-                                           parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await app.bot.send_message(chat_id=chat_id, text=channel_msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             except Exception as e:
-                logger.error("Failed to post welcome message in chat %s: %s", chat_id, e)
+                logger.error("Failed to post fallback welcome to chat %s: %s", chat_id, e)
 
         # Log to DATA channel
         if DATA_CHANNEL_ID:
@@ -296,48 +288,72 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"🗨️ Chat ID: {chat_id}"
             )
             try:
-                await app.bot.send_message(chat_id=DATA_CHANNEL_ID, text=log_text,
-                                           parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await app.bot.send_message(chat_id=DATA_CHANNEL_ID, text=log_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             except Exception as e:
-                logger.error("Failed to send log to DATA_CHANNEL_ID: %s", e)
+                logger.error("Failed to send approval log to DATA_CHANNEL_ID: %s", e)
 
     except Exception as e:
         logger.exception("Error handling join request: %s", e)
         await safe_send_log(app, f"❗ Error handling join request:\n<code>{html_escape(str(e))}</code>")
 
 
-# ------------
+# -------------------------
 # Error handler
-# ------------
+# -------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Log the error and alert admin log
     logger.exception("Unhandled exception: %s", context.error)
     await safe_send_log(context.application, f"❗ Unhandled exception:\n<code>{html_escape(str(context.error))}</code>")
 
 
-# ------------
-# App entry
-# ------------
+# -------------------------
+# App runtime: robust runner with Conflict retry/backoff
+# -------------------------
+async def _runner(app):
+    backoff = 5
+    while True:
+        try:
+            logger.info("Starting Application.run_polling()...")
+            # run_polling is an async coroutine in modern PTB; await it
+            await app.run_polling()
+            logger.info("run_polling exited normally.")
+            return
+        except tg_error.Conflict as e:
+            logger.warning("Telegram Conflict (another getUpdates running): %s", e)
+            await safe_send_log(app, f"⚠️ Conflict: another getUpdates instance. Retrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+        except Exception as e:
+            logger.exception("Unexpected error in run loop: %s", e)
+            await safe_send_log(app, f"❗ Unexpected error: {html_escape(str(e))}\nRetrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+
 def main() -> None:
     load_data()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
+    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("users", users_cmd, filters=filters.User(ADMIN_IDS)))
     app.add_handler(CommandHandler("details", details_cmd, filters=filters.User(ADMIN_IDS)))
     app.add_handler(CommandHandler("promotion", promotion_cmd, filters=filters.User(ADMIN_IDS)))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd, filters=filters.User(ADMIN_IDS)))
 
-    # Chat join request handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
 
-    # Error handler
     app.add_error_handler(error_handler)
 
-    logger.info("Bot starting — run_polling (listening for chat_join_request updates)...")
-    # Ask PTB to include chat_join_request updates
-    app.run_polling(allowed_updates=["chat_join_request", "message", "edited_message", "callback_query"])
+    # Run runner in asyncio
+    try:
+        asyncio.run(_runner(app))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, exiting.")
+    except Exception as e:
+        logger.exception("Fatal error in main: %s", e)
+
 
 if __name__ == "__main__":
     main()
