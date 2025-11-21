@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Advanced Auto-Approve Bot — robust, production-ready.
+Advanced Auto-Approve Bot — robust, event-loop-safe.
 
-Features:
-- Auto-approve chat join requests
-- DM welcome + promotion if user has started bot
-- Fallback to posting a mention in the channel/group if DM fails
-- Log approvals to DATA_CHANNEL_ID
-- Persist approvals to a JSON file (PERSIST_FILE)
-- Admin commands: /start, /users, /details, /promotion, /broadcast
-- Retries on Telegram 409 Conflict (another getUpdates instance)
+Key points:
+- Auto-approves join requests
+- DM welcome+promo if user started the bot; otherwise post a mention in the chat
+- Persist approvals to JSON
+- Log to DATA channel and optional LOG channel
+- Handles 409 Conflict by retrying with backoff (synchronously)
+- Avoids creating/closing event loops incorrectly on Python 3.13
 """
 
 import os
 import json
 import logging
-import asyncio
+import time
 import html
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
@@ -56,7 +55,6 @@ for part in ADMIN_IDS_RAW.split(","):
     try:
         ADMIN_IDS.append(int(p))
     except ValueError:
-        # ignore invalid entries
         pass
 
 # -------------------------
@@ -71,19 +69,13 @@ logger = logging.getLogger("auto_approve_bot")
 # -------------------------
 # Persistence (JSON)
 # -------------------------
-# DATA structure:
-# {
-#   "promotion_message": "",
-#   "chats": {
-#       "<chat_id>": {
-#           "title": "<chat_title>",
-#           "users": [ { "id": int, "full_name": str, "username": str|None, "approved_at": iso } ]
-#       }
-#   }
-# }
-
 DATA: Dict[str, Any] = {"promotion_message": "", "chats": {}}
-DATA_LOCK = asyncio.Lock()
+# We still use an asyncio.Lock for handler coroutines; it's fine to create it globally
+try:
+    import asyncio
+    DATA_LOCK = asyncio.Lock()
+except Exception:
+    DATA_LOCK = None  # fallback, shouldn't happen in PTB runtime
 
 
 def load_data() -> None:
@@ -133,12 +125,12 @@ def html_escape(s: Optional[str]) -> str:
 
 
 # -------------------------
-# Command handlers
+# Commands
 # -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 Hello!\n\n"
-        "This bot auto-approves join requests (if the bot is admin in the group/channel), "
+        "This bot auto-approves join requests (if the bot is admin in the channel/group),\n"
         "DMs welcome+promo when possible, logs approvals to your data channel and stores users in JSON.\n\n"
         "Admin commands:\n"
         "/users - total approved users stored\n"
@@ -153,7 +145,11 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not is_admin(u.id):
         return
-    async with DATA_LOCK:
+    # Acquire the asyncio lock if available
+    if DATA_LOCK is not None:
+        async with DATA_LOCK:
+            total = sum(len(c.get("users", [])) for c in DATA.get("chats", {}).values())
+    else:
         total = sum(len(c.get("users", [])) for c in DATA.get("chats", {}).values())
     await update.effective_message.reply_text(f"📦 Total approved users stored: {total}")
 
@@ -162,16 +158,19 @@ async def details_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     u = update.effective_user
     if not u or not is_admin(u.id):
         return
-    async with DATA_LOCK:
+    if DATA_LOCK is not None:
+        async with DATA_LOCK:
+            chats = DATA.get("chats", {})
+            if not chats:
+                await update.effective_message.reply_text("ℹ️ No data yet.")
+                return
+            lines = [f"• {info.get('title') or str(cid)} ({cid}): {len(info.get('users', []))} users" for cid, info in chats.items()]
+    else:
         chats = DATA.get("chats", {})
         if not chats:
             await update.effective_message.reply_text("ℹ️ No data yet.")
             return
-        lines: List[str] = []
-        for cid, info in chats.items():
-            title = info.get("title") or str(cid)
-            count = len(info.get("users", []))
-            lines.append(f"• {title} ({cid}): {count} users")
+        lines = [f"• {info.get('title') or str(cid)} ({cid}): {len(info.get('users', []))} users" for cid, info in chats.items()]
     await update.effective_message.reply_text("📊 Channel-wise details:\n" + "\n".join(lines))
 
 
@@ -180,7 +179,11 @@ async def promotion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not u or not is_admin(u.id):
         return
     msg = " ".join(context.args).strip() if context.args else ""
-    async with DATA_LOCK:
+    if DATA_LOCK is not None:
+        async with DATA_LOCK:
+            DATA["promotion_message"] = msg or ""
+            save_data()
+    else:
         DATA["promotion_message"] = msg or ""
         save_data()
     await update.effective_message.reply_text("✅ Promotion message updated." if msg else "✅ Promotion message cleared.")
@@ -195,8 +198,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("❗ Usage: /broadcast <text>")
         return
 
-    async with DATA_LOCK:
-        recipients: Set[int] = set()
+    if DATA_LOCK is not None:
+        async with DATA_LOCK:
+            recipients: Set[int] = set()
+            for info in DATA.get("chats", {}).values():
+                for uinfo in info.get("users", []):
+                    uid = uinfo.get("id")
+                    if isinstance(uid, int):
+                        recipients.add(uid)
+    else:
+        recipients = set()
         for info in DATA.get("chats", {}).values():
             for uinfo in info.get("users", []):
                 uid = uinfo.get("id")
@@ -210,21 +221,21 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(chat_id=uid, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             sent += 1
-            await asyncio.sleep(0.02)
+            time.sleep(0.02)  # small pause to reduce flood risk
         except Exception:
             failed += 1
     await update.effective_message.reply_text(f"✅ Broadcast finished. Sent: {sent}, Failed: {failed}")
 
 
 # -------------------------
-# Join request handler (DM if possible; fallback to channel mention)
+# Join request handler (DM if possible; fallback to mention)
 # -------------------------
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     req: ChatJoinRequest = update.chat_join_request
     app = context.application
 
     try:
-        # Approve via API call (works reliably)
+        # Approve via API
         try:
             await context.bot.approve_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
         except Exception as e:
@@ -241,7 +252,16 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         approved_at = datetime.utcnow().isoformat()
 
         # Persist
-        async with DATA_LOCK:
+        if DATA_LOCK is not None:
+            async with DATA_LOCK:
+                chats = DATA.setdefault("chats", {})
+                chat_entry = chats.setdefault(str(chat_id), {"title": channel_title, "users": []})
+                chat_entry["title"] = channel_title
+                exists = any(u.get("id") == user_id for u in chat_entry["users"])
+                if not exists and user_id:
+                    chat_entry["users"].append({"id": user_id, "full_name": full_name, "username": username, "approved_at": approved_at})
+                save_data()
+        else:
             chats = DATA.setdefault("chats", {})
             chat_entry = chats.setdefault(str(chat_id), {"title": channel_title, "users": []})
             chat_entry["title"] = channel_title
@@ -252,10 +272,12 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Prepare messages
         welcome_text = f"🎉 You’re in!\n\nWelcome to {channel_title}.\nWe’ve approved your join request — enjoy the content!"
-        async with DATA_LOCK:
+        if DATA_LOCK is not None:
+            async with DATA_LOCK:
+                promo = DATA.get("promotion_message", "").strip()
+        else:
             promo = DATA.get("promotion_message", "").strip()
 
-        # Try DM first
         dm_ok = False
         if user_id:
             try:
@@ -265,7 +287,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as e:
                 logger.info("Could not DM user %s: %s", user_id, e)
 
-        # Fallback: post in the chat with mention
         if not dm_ok:
             mention = f'<a href="tg://user?id={user_id}">{html_escape(full_name)}</a>'
             channel_msg = f"🎉 {mention} has been approved to join <b>{html_escape(channel_title)}</b>."
@@ -294,42 +315,26 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         logger.exception("Error handling join request: %s", e)
-        await safe_send_log(app, f"❗ Error handling join request:\n<code>{html_escape(str(e))}</code>")
+        try:
+            await safe_send_log(app, f"❗ Error handling join request:\n<code>{html_escape(str(e))}</code>")
+        except Exception:
+            logger.warning("safe_send_log also failed.")
 
 
 # -------------------------
 # Error handler
 # -------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Log the error and alert admin log
     logger.exception("Unhandled exception: %s", context.error)
-    await safe_send_log(context.application, f"❗ Unhandled exception:\n<code>{html_escape(str(context.error))}</code>")
+    try:
+        await safe_send_log(context.application, f"❗ Unhandled exception:\n<code>{html_escape(str(context.error))}</code>")
+    except Exception:
+        logger.warning("safe_send_log failed in error_handler.")
 
 
 # -------------------------
-# App runtime: robust runner with Conflict retry/backoff
+# Main: synchronous robust runner
 # -------------------------
-async def _runner(app):
-    backoff = 5
-    while True:
-        try:
-            logger.info("Starting Application.run_polling()...")
-            # run_polling is an async coroutine in modern PTB; await it
-            await app.run_polling()
-            logger.info("run_polling exited normally.")
-            return
-        except tg_error.Conflict as e:
-            logger.warning("Telegram Conflict (another getUpdates running): %s", e)
-            await safe_send_log(app, f"⚠️ Conflict: another getUpdates instance. Retrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)
-        except Exception as e:
-            logger.exception("Unexpected error in run loop: %s", e)
-            await safe_send_log(app, f"❗ Unexpected error: {html_escape(str(e))}\nRetrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)
-
-
 def main() -> None:
     load_data()
 
@@ -346,13 +351,44 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
 
-    # Run runner in asyncio
-    try:
-        asyncio.run(_runner(app))
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user, exiting.")
-    except Exception as e:
-        logger.exception("Fatal error in main: %s", e)
+    # Synchronous retry/backoff loop — avoids nested event loop issues
+    backoff = 5
+    while True:
+        try:
+            logger.info("Starting Application.run_polling()...")
+            # run_polling is synchronous from the caller's perspective; it manages its own loop internally.
+            app.run_polling(allowed_updates=["chat_join_request", "message", "edited_message", "callback_query"])
+            logger.info("run_polling exited normally.")
+            break
+        except tg_error.Conflict as e:
+            logger.warning("Telegram Conflict (another getUpdates running): %s", e)
+            try:
+                # best-effort notify admins via bot (may fail if bot not initialized); ignore exceptions
+                # note: app.bot is available after build; sending here may fail if token invalid
+                if app and app.bot:
+                    try:
+                        # fire-and-forget: create a task? just attempt send synchronously via app.bot
+                        app.bot.send_message(chat_id=LOG_CHANNEL_ID or DATA_CHANNEL_ID, text=f"⚠️ Conflict: {e}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            logger.info("Retrying in %s seconds...", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+        except Exception as e:
+            logger.exception("Unexpected error in run loop: %s", e)
+            try:
+                if app and app.bot:
+                    try:
+                        app.bot.send_message(chat_id=LOG_CHANNEL_ID or DATA_CHANNEL_ID, text=f"❗ Unexpected error: {e}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            logger.info("Retrying in %s seconds...", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
 
 
 if __name__ == "__main__":
