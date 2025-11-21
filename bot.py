@@ -1,208 +1,315 @@
 import os
 import json
 import logging
-from typing import Dict, Any
+import asyncio
+from datetime import datetime
+from typing import Dict, Any, List, Set
+
 from dotenv import load_dotenv
-from telegram import Update, ChatJoinRequest, Chat
+from telegram import Update, ChatJoinRequest
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
-    ContextTypes,
+    Application,
     CommandHandler,
+    ContextTypes,
     ChatJoinRequestHandler,
-    MessageHandler,
-    filters
+    filters,
 )
+
+# ----------------------------------
+# Environment and configuration
+# ----------------------------------
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-DATA_CHANNEL_ID = int(os.getenv("DATA_CHANNEL_ID") or 0)
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID") or 0)
-PERSIST_FILE = os.getenv("PERSIST_FILE", "data.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+DATA_CHANNEL_ID = int(os.getenv("DATA_CHANNEL_ID", "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+PERSIST_FILE = os.getenv("PERSIST_FILE", "data.json").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required. Set it in .env.")
+
+# ----------------------------------
+# Logging
+# ----------------------------------
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("auto_approve_bot")
 
-DATA: Dict[str, Any] = {"channels": {}, "promotion": ""}
+# ----------------------------------
+# Persistence helpers (JSON)
+# Structure:
+# {
+#   "promotion_message": "text or empty",
+#   "chats": {
+#       "<chat_id>": {
+#           "title": "<chat_title>",
+#           "users": [
+#               {"id": <int>, "full_name": "<str>", "username": "<str or None>", "approved_at": "<ISO8601>"}
+#           ]
+#       }
+#   }
+# }
+# ----------------------------------
 
+def load_data() -> Dict[str, Any]:
+    if not os.path.exists(PERSIST_FILE):
+        return {"promotion_message": "", "chats": {}}
+    try:
+        with open(PERSIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "promotion_message" not in data:
+                data["promotion_message"] = ""
+            if "chats" not in data:
+                data["chats"] = {}
+            return data
+    except Exception as e:
+        logger.error(f"Failed to load {PERSIST_FILE}: {e}")
+        return {"promotion_message": "", "chats": {}}
 
-def load_data():
-    global DATA
-    if os.path.exists(PERSIST_FILE):
-        try:
-            with open(PERSIST_FILE, "r", encoding="utf-8") as f:
-                DATA = json.load(f)
-        except:
-            pass
-
-
-def save_data():
+def save_data(data: Dict[str, Any]) -> None:
     try:
         with open(PERSIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(DATA, f, indent=2)
-    except:
-        pass
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save {PERSIST_FILE}: {e}")
 
+DATA = load_data()
+DATA_LOCK = asyncio.Lock()
 
-def is_admin(uid):
-    return uid in ADMIN_IDS
+# ----------------------------------
+# Utility
+# ----------------------------------
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-# ------------------------ COMMANDS ------------------------
+async def safe_send_log(app: Application, text: str) -> None:
+    if LOG_CHANNEL_ID:
+        try:
+            await app.bot.send_message(LOG_CHANNEL_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Failed to send log to LOG_CHANNEL_ID: {e}")
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "Hi! I am your Auto Approve Bot.\n\n"
-        "Admin Commands:\n"
-        "/promotion <msg>\n"
-        "/users\n"
-        "/details\n"
-        "/broadcast <msg>\n"
+# ----------------------------------
+# Command handlers
+# ----------------------------------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "👋 Hello!\n\n"
+        "This is an Auto-Approve Bot for Channel/Group Join Requests.\n"
+        "Features:\n"
+        "• Auto approves join requests\n"
+        "• Welcomes the user and sends your promotion\n"
+        "• Logs approvals to your data channel\n"
+        "• Stores approved users in JSON (no database)\n\n"
+        "Admin commands:\n"
+        "• /users – total stored approved users\n"
+        "• /details – channel-wise approved users\n"
+        "• /promotion <text> – set promotion message\n"
+        "• /broadcast <text> – send a message to all saved users\n"
     )
-    await update.message.reply_text(txt)
+    await update.effective_message.reply_text(text)
 
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    async with DATA_LOCK:
+        total = sum(len(info.get("users", [])) for info in DATA.get("chats", {}).values())
+    await update.effective_message.reply_text(f"📦 Total approved users stored: {total}")
 
-async def promotion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Not allowed.")
+async def details_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    async with DATA_LOCK:
+        chats = DATA.get("chats", {})
+        if not chats:
+            await update.effective_message.reply_text("ℹ️ No data yet.")
+            return
+        lines: List[str] = []
+        for chat_id, info in chats.items():
+            title = info.get("title") or str(chat_id)
+            count = len(info.get("users", []))
+            lines.append(f"• {title} ({chat_id}): {count} users")
+    await update.effective_message.reply_text("📊 Channel-wise details:\n" + "\n".join(lines))
 
-    msg = " ".join(context.args).strip()
+async def promotion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    text = (context.args and " ".join(context.args).strip()) if context.args else ""
+    async with DATA_LOCK:
+        DATA["promotion_message"] = text or ""
+        save_data(DATA)
+    if text:
+        await update.effective_message.reply_text("✅ Promotion message updated.")
+    else:
+        await update.effective_message.reply_text("✅ Promotion message cleared.")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    msg = (context.args and " ".join(context.args).strip()) if context.args else ""
     if not msg:
-        return await update.message.reply_text("Usage: /promotion <your message>")
+        await update.effective_message.reply_text("❗ Usage: /broadcast <text>")
+        return
 
-    DATA["promotion"] = msg
-    save_data()
-    await update.message.reply_text("Promotion message saved!")
+    # Collect unique user IDs across all chats
+    async with DATA_LOCK:
+        chats = DATA.get("chats", {})
+        recipients: Set[int] = set()
+        for info in chats.values():
+            for u in info.get("users", []):
+                uid = u.get("id")
+                if isinstance(uid, int):
+                    recipients.add(uid)
 
-
-async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Not allowed.")
-
-    total = sum(len(v["users"]) for v in DATA["channels"].values())
-    await update.message.reply_text(f"Total approved users: {total}")
-
-
-async def details_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Not allowed.")
-
-    msg = ""
-    for cid, info in DATA["channels"].items():
-        msg += f"{info['title']} ({cid}) — {len(info['users'])} users\n"
-
-    if not msg:
-        msg = "No data yet."
-
-    await update.message.reply_text(msg)
-
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Not allowed.")
-
-    message = " ".join(context.args).strip()
-    if not message:
-        return await update.message.reply_text("Usage: /broadcast <message>")
-
-    all_users = set()
-    for info in DATA["channels"].values():
-        all_users.update(info["users"])
+    await update.effective_message.reply_text(f"🚀 Broadcasting to {len(recipients)} users...")
 
     sent = 0
-    fail = 0
-    for uid in all_users:
+    failed = 0
+    for uid in recipients:
         try:
-            await context.bot.send_message(uid, message)
+            await context.bot.send_message(chat_id=uid, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             sent += 1
-        except:
-            fail += 1
+            await asyncio.sleep(0.02)  # gentle pacing
+        except Exception:
+            failed += 1
+            continue
 
-    await update.message.reply_text(f"Broadcast done.\nSent: {sent}\nFailed: {fail}")
+    await update.effective_message.reply_text(f"✅ Broadcast finished. Sent: {sent}, Failed: {failed}")
 
+# ----------------------------------
+# Join request handler
+# ----------------------------------
 
-# ------------------------ JOIN REQUEST ------------------------
-
-async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     req: ChatJoinRequest = update.chat_join_request
-    user = req.from_user
-    chat: Chat = req.chat
-
-    # Approve
-    await context.bot.approve_chat_join_request(chat.id, user.id)
-
-    # Save data
-    cid = str(chat.id)
-    if cid not in DATA["channels"]:
-        DATA["channels"][cid] = {"title": chat.title, "users": []}
-
-    if user.id not in DATA["channels"][cid]["users"]:
-        DATA["channels"][cid]["users"].append(user.id)
-
-    save_data()
-
-    # User DM
-    promo = DATA["promotion"]
-    msg = f"Welcome {user.first_name}! Approved for {chat.title}."
-    if promo:
-        msg += f"\n\n{promo}"
+    app = context.application
 
     try:
-        await context.bot.send_message(user.id, msg)
-    except:
-        pass
+        # Approve request
+        await req.approve()
 
-    # Log to database channel
-    if DATA_CHANNEL_ID:
-        username = f"@{user.username}" if user.username else "None"
-        log_msg = (
-            "🔔 New Join Approved\n\n"
-            f"👤 {user.full_name}\n"
-            f"🆔 {user.id}\n"
-            f"🎭 Username: {username}\n"
-            f"🏷️ Channel: {chat.title}\n"
-            f"💬 Chat ID: {chat.id}"
+        user = req.from_user
+        chat = req.chat
+
+        full_name = (user.full_name or "").strip() if user else "Unknown"
+        username = user.username if user and user.username else None
+        user_id = user.id if user else 0
+        chat_id = chat.id if chat else 0
+        channel_title = (chat.title or "").strip() if chat else "Unknown"
+        approved_at = datetime.utcnow().isoformat()
+
+        # Persist user to JSON
+        async with DATA_LOCK:
+            chats = DATA.setdefault("chats", {})
+            chat_entry = chats.setdefault(str(chat_id), {"title": channel_title, "users": []})
+            # Update title if changed
+            chat_entry["title"] = channel_title
+
+            # Prevent duplicates
+            exists = any(u.get("id") == user_id for u in chat_entry["users"])
+            if not exists and user_id:
+                chat_entry["users"].append(
+                    {"id": user_id, "full_name": full_name, "username": username, "approved_at": approved_at}
+                )
+            save_data(DATA)
+
+        # DM welcome and promotion
+        welcome_text = (
+            "🎉 You’re in!\n\n"
+            f"Welcome to {channel_title}.\n"
+            "We’ve approved your join request—enjoy the content!"
         )
         try:
-            await context.bot.send_message(DATA_CHANNEL_ID, log_msg)
-        except:
-            pass
+            await app.bot.send_message(
+                chat_id=user_id,
+                text=welcome_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send welcome DM to {user_id}: {e}")
 
+        # Promotion message (if set)
+        async with DATA_LOCK:
+            promo = DATA.get("promotion_message", "").strip()
+        if promo:
+            try:
+                await app.bot.send_message(
+                    chat_id=user_id,
+                    text=promo,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send promo DM to {user_id}: {e}")
 
-# ------------------------ UNKNOWN COMMAND ------------------------
+        # Log to Data Channel
+        if DATA_CHANNEL_ID:
+            log_text = (
+                "🔔 New Join Request Approved\n\n"
+                f"👤 User: {full_name}\n"
+                f"🆔 ID: {user_id}\n"
+                f"🎭 Username: {username if username else 'None'}\n"
+                f"🏷️ Channel: {channel_title}\n"
+                f"💬 Chat ID: {chat_id}"
+            )
+            try:
+                await app.bot.send_message(
+                    chat_id=DATA_CHANNEL_ID,
+                    text=log_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send approval log to DATA_CHANNEL_ID: {e}")
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Unknown command.")
+    except Exception as e:
+        logger.exception(f"Error handling join request: {e}")
+        await safe_send_log(context.application, f"❗ Error handling join request:\n<code>{e}</code>")
 
+# ----------------------------------
+# Error handler (optional internal logs)
+# ----------------------------------
 
-# ------------------------ MAIN ------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+    await safe_send_log(context.application, f"❗ Unhandled exception:\n<code>{context.error}</code>")
 
-def main():
-    load_data()
+# ----------------------------------
+# Application setup
+# ----------------------------------
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+def main() -> None:
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Commands
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("promotion", promotion_cmd))
-    app.add_handler(CommandHandler("users", users_cmd))
-    app.add_handler(CommandHandler("details", details_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("users", users_cmd, filters=filters.User(ADMIN_IDS)))
+    application.add_handler(CommandHandler("details", details_cmd, filters=filters.User(ADMIN_IDS)))
+    application.add_handler(CommandHandler("promotion", promotion_cmd, filters=filters.User(ADMIN_IDS)))
+    application.add_handler(CommandHandler("broadcast", broadcast_cmd, filters=filters.User(ADMIN_IDS)))
 
-    # Join request
-    app.add_handler(ChatJoinRequestHandler(approve_request))
+    # Auto-approve join requests
+    application.add_handler(ChatJoinRequestHandler(handle_join_request))
 
-    # Unknown
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    # Error handler
+    application.add_error_handler(error_handler)
 
-    print("Bot running on Render...")
-    app.run_polling()
-
+    # Run polling (no Updater, PTB >= 20)
+    application.run_polling(allowed_updates=["chat_join_request"])
 
 if __name__ == "__main__":
     main()
